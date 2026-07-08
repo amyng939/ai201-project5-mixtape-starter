@@ -235,3 +235,68 @@ darius rates 'Midnight Drive' 5 stars: nova notifications 1 -> 1  (new notificat
 rating was saved to the DB? True  (so the action worked - only the notification is missing)
 ```
 The script deletes the rating it creates, so the database is left unchanged.
+
+---
+
+## Milestone 3: Root Cause Analysis
+
+### Issue #1 — My listening streak keeps resetting (kenji)
+
+**How I reproduced it.** I ran [`repro_issue1.py`](repro_issue1.py), which drives
+`update_listening_streak(user, now)` with a controlled clock: a user with
+`listening_streak = 12` and `last_listened_at` on a **Saturday**, then a listen
+on the following **Sunday**. Before the fix the streak dropped to **1** instead
+of going to **13**. The control case (previous listen Thursday, new listen Friday)
+correctly incremented, so the failure was specific to Sunday — matching kenji's
+report that it only ever happened on Sundays.
+
+**How I found the root cause.** I traced the call chain top-down from the action
+kenji described. Recording a listen is `POST /songs/<id>/listen`, so I started in
+[`routes/songs.py`](routes/songs.py#L43): the `listen()` route calls
+`record_listening_event(user_id, song_id)`. That led me to
+[`services/streak_service.py`](services/streak_service.py), where
+`record_listening_event()` creates the event and then calls
+`update_listening_streak(user, now)`. Reading that function, the streak math is a
+three-way branch on `days_since_last`. The "consecutive day" branch was:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+```
+
+The `and today.weekday() != 6` clause is what made me confident this was the
+exact cause, not just a suspicious area: it's the only part of the logic that
+depends on *which* weekday it is, and kenji's bug was weekday-specific.
+
+**The root cause.** Python's `datetime.date.weekday()` returns **6 for Sunday**
+(Monday = 0 … Sunday = 6). The increment branch required both
+`days_since_last == 1` *and* `today.weekday() != 6`. On a Sunday, a genuine
+consecutive-day listen satisfies `days_since_last == 1` but fails
+`today.weekday() != 6`, so execution fell through to the `else:` branch, which
+sets `user.listening_streak = 1`. The effect: any streak update that landed on a
+Sunday was treated as a skipped-day reset instead of an increment, wiping the
+streak — exactly what kenji saw (12 → 1 on Sunday, then counting up again from
+Monday). On every other weekday the extra condition was true, so the increment
+worked normally, which is why the bug was invisible six days a week.
+
+**My fix and side-effect check.** I removed the spurious `and today.weekday() != 6`
+condition so the branch is simply:
+
+```python
+elif days_since_last == 1:
+    user.listening_streak += 1
+```
+
+A consecutive-day listen now increments regardless of weekday, which is the
+intended behavior. After the change I re-ran `repro_issue1.py` — the Sunday case
+now returns **13** — and ran the streak test suite:
+
+```
+$ ./.venv/Scripts/python.exe -m pytest tests/test_streaks.py -v
+5 passed
+```
+
+All five pass, including `test_streak_increments_on_sunday` (the direct
+regression test for this bug) and `test_streak_resets_after_skipped_day`, which
+checks the *other* side of the boundary — confirming the streak still resets when
+a day is genuinely skipped, and I didn't over-correct.
