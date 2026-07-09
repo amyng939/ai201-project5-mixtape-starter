@@ -1,5 +1,32 @@
 # Project 5: Mixtape — Submission
 
+## AI Usage
+
+**1. Reproducing the issues (writing deterministic repro scripts).** All three
+bugs are hard to trigger by hand because they depend on state or timing the live
+endpoints don't let you control: Issue #1 only fires on a Sunday, Issue #2 needs a
+friend whose last listen was late *yesterday* but within 24h, and Issue #4 shows
+nothing until an actual rating is performed. I used AI to help write the
+`repro_issue1/2/4.py` scripts that set those exact conditions up programmatically
+— passing a controlled "now" into `update_listening_streak()`, inserting a
+listening event timestamped to 11:59pm yesterday, and performing a rating while
+snapshotting notification counts before/after. I also had it make the scripts
+non-destructive (transaction rollback for the read-only feed/streak cases, and an
+id-diff cleanup for the rating case) so they don't corrupt the seed database, and
+keep them meaningful before *and* after each fix. I confirmed each reproduction
+myself by reading the script output against the reported symptom.
+
+**2. Understanding the data model (ruling out a red herring in Issue #2).** While
+investigating the feed, I noticed that darius's `User.last_listened_at` (yesterday)
+didn't match his most recent row in the `ListeningEvent` table, and I suspected
+that mismatch was the bug. I asked AI to walk me through how
+`get_friends_listening_now()` actually pulls its data. It pointed out that the
+feed query filters purely on `ListeningEvent.listened_at` and never reads
+`last_listened_at` at all — that field belongs to the streak feature (Issue #1),
+not the feed. That kept me from "fixing" the wrong field and refocused me on the
+real cause (the 24-hour cutoff). I verified this by re-reading the query myself
+before moving on.
+
 ## Milestone 1: Codebase Map
 
 Mixtape is a social music app (Flask + SQLAlchemy, SQLite) where friends share
