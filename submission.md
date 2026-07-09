@@ -372,3 +372,69 @@ Side-effect checks:
   suite for the feed, so I verified behavior with the repro script rather than
   pytest. The 2 failing tests in `pytest tests/` are the unrelated open Issue #5
   (playlist last song).
+
+### Issue #4 — No notification when a friend rates my song (aaliya)
+
+**How I reproduced it.** [`repro_issue4.py`](repro_issue4.py). The bug isn't
+visible in the seed data (aaliya shared 0 songs; there are 0 ratings until the
+endpoint is called), so I performed a rating and compared notification counts:
+darius rates nova's song "Midnight Drive" 5 stars, and I check nova's
+notifications before and after. Before the fix the count was unchanged
+(`1 -> 1`, new rating notification? **False**) even though the `Rating` row was
+saved — the action worked, only the notification was missing. The playlist path,
+by contrast, already had a notification for nova, confirming notifications work in
+general.
+
+**How I found the root cause.** I followed the rating action from the route.
+`POST /songs/<id>/rate` in [`routes/songs.py`](routes/songs.py#L29) calls
+`notification_service.rate_song()`. Both notification-generating actions live in
+[`services/notification_service.py`](services/notification_service.py), so I read
+`rate_song()` and `add_to_playlist()` side by side. `add_to_playlist()` ends with
+a `create_notification(...)` call to `song.shared_by`; `rate_song()` validated the
+score, upserted the `Rating`, committed, and `return`ed — with **no
+`create_notification()` call anywhere**. That structural difference between two
+otherwise-parallel functions was the moment it was clearly the root cause, not
+just a suspicious area.
+
+**The root cause.** `rate_song()` simply never created a notification. It
+persisted the rating and returned, so the sharer was never told. This wasn't a
+wrong condition or a bad comparison — it was a **missing step**: the notification
+side effect that `add_to_playlist()` performs was absent from the rating path.
+That's why ratings "just never happened" as notifications for anyone, while
+playlist-adds worked.
+
+**My fix and side-effect check.** I added the missing notification to
+`rate_song()`, after the rating is committed, mirroring the `add_to_playlist()`
+pattern:
+
+```python
+db.session.commit()
+
+# Notify the person who originally shared the song (unless they rated it themselves)
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' a '{score}'.",
+    )
+
+return rating
+```
+
+The `if song.shared_by != user_id` guard matches `add_to_playlist()`'s behavior so
+you don't get notified for rating your own song, and it's placed *after* the
+commit so a failed rating never produces a spurious notification. The function
+still returns the `Rating` (I confirmed `return rating` is intact), so the route's
+`rating.to_dict()` response is unchanged.
+
+Side-effect checks:
+- Re-ran `repro_issue4.py`: rating now produces `1 -> 2` with a
+  `song_rated` notification (`"darius rated your song 'Midnight Drive' a '5'."`),
+  and the `Rating` is still saved.
+- **Rate-your-own-song:** the guard means a user rating a song they shared gets no
+  notification — verified no notification is created in that case.
+- **Existing rating path:** re-rating (the upsert branch that updates an existing
+  score) still works and still notifies; the notification is keyed off the song's
+  sharer, independent of whether the rating was new or updated.
+- Confirmed the unchanged **playlist-add** and **`get_notifications`** paths still
+  behave as before.
