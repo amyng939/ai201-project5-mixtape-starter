@@ -186,25 +186,40 @@ The script uses `db.session.rollback()`, so it never modifies the database.
 
 ### Issue #2 — "Friends Listening Now" shows people from yesterday (nova)
 
-**How I reproduced it:** the live endpoint
-`GET /feed/<user_id>/listening-now` for nova
-(`/feed/680aa719-8d0b-4cd6-b8f6-965bde74dba4/listening-now`).
+**How I reproduced it:** two ways.
 
-- **Action:** open nova's `listening-now` feed.
-- **Actual result:** darius appears in the feed as "listening now," even though
-  his last listen was the **previous evening** (nova knew this independently —
-  he'd told her he played it at 11pm before bed and hadn't opened the app all
-  morning). The feed is supposed to show who's listening *now* / today, so a
-  friend whose last listen was last night should not be there.
-- **Data condition that triggers it:** a friend whose most recent listen was on
-  the previous calendar day but still **less than 24 hours ago** (e.g. 11pm
-  yesterday, viewed at 9am today).
+*Deterministic script — [`repro_issue2.py`](repro_issue2.py).* This is the
+reliable reproduction. A fresh same-day seed hides the bug: every friend's most
+recent listen is only a few hours old, so all of them are genuinely "today" and
+the feed looks correct. The bug needs a specific **data condition** — a friend
+whose most recent listen was on the **previous calendar day** but still **less
+than 24 hours ago** (nova's story: darius played a song at 11pm last night, she
+checked at 9am). So the script sets darius up with a single listen timestamped
+11:59pm *yesterday* and nothing today, then compares the two window definitions
+on that data:
 
-**Root of it:** `get_friends_listening_now()` filters on
+```
+OLD 24h window (the bug):   nova sees ['darius', 'simone', 'kenji']
+  darius shown though he listened yesterday? True
+TODAY-only (the fix):        nova sees []
+```
+
+The action mirrors `GET /feed/<user_id>/listening-now`. darius appears under the
+24-hour window even though his listen was yesterday — the reported symptom.
+
+*Live endpoint, after the date rolled over.* Because the seed timestamps are all
+2026-07-08 and I was testing just after 00:00 UTC on 2026-07-09, every seeded
+listen had become "yesterday" while still being <24h old. Hitting
+`/feed/680aa719-8d0b-4cd6-b8f6-965bde74dba4/listening-now` on the running server
+therefore listed darius/simone/kenji as "listening now" even though nobody had
+listened on the new calendar day — the same bug, observed live.
+
+**Root of it (confirmed at fix time):** `get_friends_listening_now()` built its
+cutoff as `datetime.now(timezone.utc) - RECENT_THRESHOLD`, where
 `RECENT_THRESHOLD = timedelta(hours=24)` — a *rolling 24-hour* window rather than
 "today." A late-yesterday listen stays inside that window until the same clock
-time the next day, which is exactly the "hangs around until the same time the
-next day" behavior nova described.
+time the next day, exactly the "hangs around until the same time the next day"
+behavior nova described.
 
 ### Issue #4 — No notification when a friend rates my song (aaliya)
 
@@ -300,3 +315,60 @@ All five pass, including `test_streak_increments_on_sunday` (the direct
 regression test for this bug) and `test_streak_resets_after_skipped_day`, which
 checks the *other* side of the boundary — confirming the streak still resets when
 a day is genuinely skipped, and I didn't over-correct.
+
+### Issue #2 — Friends Listening Now shows people from yesterday (nova)
+
+**How I reproduced it.** See the Milestone 2 entry for the full account. In short:
+[`repro_issue2.py`](repro_issue2.py) gives darius a single listen at 11:59pm
+*yesterday* and shows that the old 24-hour window still lists him as "listening
+now" (`['darius', 'simone', 'kenji']`) while a today-only window drops him (`[]`).
+I also saw it live: testing just after 00:00 UTC, the seeded 07-08 listens had all
+become "yesterday" yet stayed <24h old, so the endpoint still showed them.
+
+**How I found the root cause.** I started from the endpoint nova used,
+`GET /feed/<id>/listening-now`, in [`routes/feed.py`](routes/feed.py#L9), which
+calls `feed_service.get_friends_listening_now()`. In
+[`services/feed_service.py`](services/feed_service.py) the first thing that
+function does is build a time cutoff: `cutoff = datetime.now(timezone.utc) -
+RECENT_THRESHOLD`, with `RECENT_THRESHOLD = timedelta(hours=24)`, then filter
+`ListeningEvent.listened_at >= cutoff`. That single line is the whole bug — the
+feed's notion of "now" was "any time in the last 24 hours."
+
+Along the way I chased a **red herring**: darius's `User.last_listened_at`
+(yesterday) doesn't match his most recent `ListeningEvent` (today) in the seed. I
+ruled it out by reading the query — `get_friends_listening_now()` never reads
+`last_listened_at`; it filters purely on `ListeningEvent.listened_at`. That
+mismatch belongs to the streak feature (Issue #1), not the feed.
+
+**The root cause.** "Listening now" was implemented as a **rolling 24-hour
+window**, not the current calendar day. `cutoff = now - 24h` means an event
+qualifies as "now" for a full 24 hours after it happens. So a listen at 11pm
+yesterday is still within the window at 9am today (only 10 hours old) and is shown
+as if the friend were listening now. The window only clears a given listen 24
+hours later — hence nova's "stuff from yesterday evening hangs around until the
+same time the next day."
+
+**My fix and side-effect check.** I changed the cutoff from "24 hours ago" to
+"the start of today (UTC midnight)" and kept the same `>=` comparison:
+
+```python
+cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+...
+ListeningEvent.listened_at >= cutoff,
+```
+
+Now only listens from the current calendar day qualify, so yesterday-evening
+listens are excluded the instant the date rolls over. I also removed the
+now-unused `RECENT_THRESHOLD` constant. (`timedelta` is no longer used in this
+file and could be dropped from the import as a follow-up cleanup.)
+
+Side-effect checks:
+- **Both sides of the boundary** (this is a boundary bug): via `repro_issue2.py`,
+  an 11:59pm-*yesterday* listen is now excluded, and the live function returns the
+  today-only set. A listen just after midnight *today* still qualifies.
+- **The other function in the file**, `get_activity_feed()`, is intentionally
+  *not* recency-filtered (it returns the most recent N events regardless of date),
+  so it doesn't share this cutoff and was unaffected. There is no automated test
+  suite for the feed, so I verified behavior with the repro script rather than
+  pytest. The 2 failing tests in `pytest tests/` are the unrelated open Issue #5
+  (playlist last song).
